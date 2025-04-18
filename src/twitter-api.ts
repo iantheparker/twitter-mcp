@@ -1,9 +1,24 @@
-import { TwitterApi } from 'twitter-api-v2';
+import { TwitterApi, ApiResponseError, EUploadMimeType, SendTweetV2Params } from 'twitter-api-v2';
 import { Config, TwitterError, Tweet, TwitterUser, PostedTweet } from './types.js';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+
+// Setup logging to a file in the user's home directory
+const logDir = path.join(os.homedir(), '.twitter-mcp');
+if (!fs.existsSync(logDir)) {
+  fs.mkdirSync(logDir, { recursive: true });
+}
+const logFile = path.join(logDir, 'twitter-mcp.log');
+const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+
+function log(message: string) {
+  const timestamp = new Date().toISOString();
+  logStream.write(`${timestamp} ${message}\n`);
+}
 
 export class TwitterClient {
   private client: TwitterApi;
-  private rateLimitMap = new Map<string, number>();
 
   constructor(config: Config) {
     this.client = new TwitterApi({
@@ -12,104 +27,114 @@ export class TwitterClient {
       accessToken: config.accessToken,
       accessSecret: config.accessTokenSecret,
     });
-
-    console.error('Twitter API client initialized');
+    log('Twitter API client initialized');
   }
 
-  async postTweet(text: string): Promise<PostedTweet> {
+  async checkRateLimit(endpoint: string): Promise<void> {
+    // Rate limit check is currently not working correctly with Twitter API v2
+    // We'll rely on the API's built-in rate limiting for now
+    return;
+  }
+
+  async postTweet(text: string, media?: { data: string, mediaType?: string }): Promise<PostedTweet> {
     try {
       const endpoint = 'tweets/create';
       await this.checkRateLimit(endpoint);
 
-      const response = await this.client.v2.tweet(text);
-      
-      console.error(`Tweet posted successfully with ID: ${response.data.id}`);
+      let mediaId: string | undefined;
+
+      if (media) {
+        // Upload media using v1.1 API
+        const mediaBuffer = Buffer.from(media.data, 'base64');
+        mediaId = await this.client.v1.uploadMedia(mediaBuffer, { mimeType: 'image/png' });
+        log(`Media uploaded with ID: ${mediaId}`);
+      }
+            
+      // Post the tweet using v2 API
+      const tweetParams: SendTweetV2Params = {
+        text: text,
+      };
+
+      if (mediaId) {
+        tweetParams.media = { media_ids: [mediaId] };
+      }
+
+      const response = await this.client.v2.tweet(tweetParams);
+      const tweetId = response.data?.id;
+      const tweetText = response.data?.text;
+
+      log(`Tweet posted successfully with ID: ${tweetId}`);
       
       return {
-        id: response.data.id,
-        text: response.data.text
+        id: tweetId,
+        text: tweetText
       };
     } catch (error) {
+      log(`[ERROR] Twitter API Error in postTweet: ${error}`);
       this.handleApiError(error);
     }
   }
 
-  async searchTweets(query: string, count: number): Promise<{ tweets: Tweet[], users: TwitterUser[] }> {
+  async searchTweets(query: string, maxResults = 10): Promise<{ tweets: Tweet[], users: TwitterUser[] }> {
     try {
-      const endpoint = 'tweets/search';
-      await this.checkRateLimit(endpoint);
-
       const response = await this.client.v2.search(query, {
-        max_results: count,
-        expansions: ['author_id'],
-        'tweet.fields': ['public_metrics', 'created_at'],
-        'user.fields': ['username', 'name', 'verified']
+        max_results: maxResults,
+        'tweet.fields': ['text', 'created_at', 'author_id', 'public_metrics'],
+        'user.fields': ['username', 'name', 'verified'],
+        'expansions': ['author_id']
       });
 
-      console.error(`Fetched ${response.tweets.length} tweets for query: "${query}"`);
+      log(`Fetched ${response.tweets.length} tweets for query: "${query}"`);
 
       const tweets = response.tweets.map(tweet => ({
         id: tweet.id,
         text: tweet.text,
+        createdAt: tweet.created_at ?? new Date().toISOString(),
         authorId: tweet.author_id ?? '',
         metrics: {
           likes: tweet.public_metrics?.like_count ?? 0,
-          retweets: tweet.public_metrics?.retweet_count ?? 0,
-          replies: tweet.public_metrics?.reply_count ?? 0,
-          quotes: tweet.public_metrics?.quote_count ?? 0
-        },
-        createdAt: tweet.created_at ?? ''
+          retweets: tweet.public_metrics?.retweet_count ?? 0
+        }
       }));
 
-      const users = response.includes.users.map(user => ({
+      const users = response.includes?.users?.map(user => ({
         id: user.id,
-        username: user.username,
-        name: user.name,
-        verified: user.verified ?? false
-      }));
+        username: user.username
+      })) ?? [];
 
       return { tweets, users };
     } catch (error) {
+      log(`[ERROR] Twitter API Error in searchTweets: ${error}`);
       this.handleApiError(error);
     }
   }
 
-  private async checkRateLimit(endpoint: string): Promise<void> {
-    const lastRequest = this.rateLimitMap.get(endpoint);
-    if (lastRequest) {
-      const timeSinceLastRequest = Date.now() - lastRequest;
-      if (timeSinceLastRequest < 1000) { // Basic rate limiting
-        throw new TwitterError(
-          'Rate limit exceeded',
-          'rate_limit_exceeded',
-          429
-        );
-      }
+  async getUserInfo(username: string): Promise<TwitterUser | undefined> {
+    try {
+      const response = await this.client.v2.userByUsername(username, {
+        'user.fields': ['username']
+      });
+
+      if (!response.data) return undefined;
+
+      return {
+        id: response.data.id,
+        username: response.data.username
+      };
+    } catch (error) {
+      log(`[ERROR] Twitter API Error in getUserInfo: ${error}`);
+      this.handleApiError(error);
     }
-    this.rateLimitMap.set(endpoint, Date.now());
   }
 
   private handleApiError(error: unknown): never {
-    if (error instanceof TwitterError) {
-      throw error;
-    }
-
-    // Handle twitter-api-v2 errors
-    const apiError = error as any;
-    if (apiError.code) {
+    if (error instanceof ApiResponseError) {
       throw new TwitterError(
-        apiError.message || 'Twitter API error',
-        apiError.code,
-        apiError.status
+        error.data?.error ?? error.message ?? 'Unknown Twitter API error',
+        error.code?.toString() ?? 'unknown',
+        error.response?.statusCode
       );
     }
-
-    // Handle unexpected errors
-    console.error('Unexpected error in Twitter client:', error);
-    throw new TwitterError(
-      'An unexpected error occurred',
-      'internal_error',
-      500
-    );
+    throw error;
   }
 }

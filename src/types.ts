@@ -14,7 +14,11 @@ export type Config = z.infer<typeof ConfigSchema>;
 export const PostTweetSchema = z.object({
     text: z.string()
         .min(1, 'Tweet text cannot be empty')
-        .max(280, 'Tweet cannot exceed 280 characters')
+        .max(280, 'Tweet cannot exceed 280 characters'),
+    media: z.array(z.object({
+        data: z.string().describe('Base64 encoded media data'),
+        mediaType: z.string().describe('MIME type of media (e.g., image/jpeg, video/mp4)')
+    })).optional()
 });
 
 export const SearchTweetsSchema = z.object({
